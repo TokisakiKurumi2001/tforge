@@ -395,8 +395,29 @@ class TForgeModel(TForgePretrainedModel):
         noise = torch.normal(0, 1, size=size).to(device=input_ids.device)
         return F.softmax(one_hot_dist + noise, dim=-1)
 
+    def encode(self, input_ids: Tensor, is_keyword: bool) -> Tensor:
+        return self.encoder(input_ids, None, pos_enc=not(is_keyword))
+
+    def reconstruct(self, keyword_ids: Tensor, hidden_input: Tensor, hidden_kw: Tensor, decoder_inp: Tensor) -> Tensor:
+        hidden_tgt = self.decoder_tgt(hidden_input, None, decoder_inp, None)
+        pre_out_tgt = self.projection_tgt(hidden_tgt)
+        copy_dist = self.make_copy_dist(keyword_ids)
+        tgt_src_align = self.soft_align(hidden_kw, hidden_tgt)
+        copy_dist_align = torch.bmm(tgt_src_align, copy_dist)
+        p_gen = self.copy_layer(hidden_kw, hidden_tgt, None)
+        pre_out_tgt = F.softmax(pre_out_tgt, dim=-1)
+        out_tgt = (1 - p_gen) * copy_dist_align + p_gen * pre_out_tgt
+        out_tgt = torch.log(out_tgt)
+        return out_tgt
+
+    def translate(self, encoder_output: Tensor, decoder_input_ids: Tensor) -> Tensor:
+        hidden_tsl = self.decoder_tsl(encoder_output, None, decoder_input_ids, None)
+        out_tsl = self.projection_tsl(hidden_tsl)
+        out_tsl = nn.LogSoftmax(dim=-1)(out_tsl)
+        return out_tsl
+
 # Wrapper for text generation
-class TForgeForGeneration:
+class TForgeForConditionalGeneration:
     def __init__(self, model: TForgeModel, alpha: float=0.6):
         self.model = model
         self.alpha = alpha
@@ -408,15 +429,19 @@ class TForgeForGeneration:
             """
             return ((5 + length) / (5 + 1)) ** alpha
 
-    def generate(self, input_ids: Tensor, num_beam: int=4, max_output_length: int=20, vocab_size: int=10000) -> Tensor:
+    def generate(self, input_ids: Tensor, keyword: Tensor, num_beam: int=4, max_output_length: int=80, vocab_size: int=10000, translate: bool=False) -> Tensor:
         self.model.eval()
         with torch.no_grad():
-            encoder_output = self.model.encoder(input_ids)
+            encoder_output = self.model.encode(input_ids, is_keyword=False)
+            if not translate:
+                kw_output = self.model.encode(keyword, is_keyword=True)
+            else:
+                kw_output = None
 
-            return self.__decode(encoder_output, max_output_length, vocab_size, num_beam)
+            return self.__decode(keyword, encoder_output, kw_output, max_output_length, vocab_size, translate, num_beam)
 
     def __decode(
-        self, encoder_output: Tensor, max_output_length: int, vocab_size: int, 
+        self, keyword_ids: Tensor, encoder_output: Tensor, kw_output: Tensor, max_output_length: int, vocab_size: int, translate: bool,
         num_beam: int, bos_token_id: int=2, eos_token_id: int=3
     ):
         # Start with <bos>
@@ -426,9 +451,15 @@ class TForgeForGeneration:
             # TForgeEncoder output expansion from the second time step to the beam size
             if i==1:
                 encoder_output = encoder_output.expand(num_beam, *encoder_output.shape[1:])
+                if not translate:
+                    kw_output = kw_output.expand(num_beam, *kw_output.shape[1:])
+                    keyword_ids = keyword_ids.expand(num_beam, *keyword_ids.shape[1:])
 
             # TForgeDecoder prediction
-            logits = self.model.decoder(encoder_output, decoder_input)
+            if not translate:
+                logits = self.model.reconstruct(keyword_ids, encoder_output, kw_output, decoder_input)
+            else:
+                logits = self.model.translate(encoder_output, decoder_input)
             logits = logits[:, -1] # Last sequence step: [beam_size, sequence_length, vocab_size] => [beam_size, vocab_size]
 
             # Softmax
