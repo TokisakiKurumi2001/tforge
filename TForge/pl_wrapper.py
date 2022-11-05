@@ -71,6 +71,6 @@ class LitTForge(pl.LightningModule):
         return loss
         
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), betas=(0.9, 0.98), eps=1.0e-9, lr=5e-5)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=5e-5)
         scheduler = TForgeScheduler(optimizer)
         return [optimizer], [scheduler]
